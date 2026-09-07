@@ -1,0 +1,752 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  linux_hardening_check.sh
+#  Security posture scanner (read-only) for Debian/Ubuntu + systemd.
+#  No changes are made to the system.
+#
+#  Usage:
+#    bash linux_hardening_check.sh                    all categories
+#    bash linux_hardening_check.sh -m ssh,firewall    specific categories
+#    bash linux_hardening_check.sh -s HIGH            only HIGH/CRITICAL
+#    bash linux_hardening_check.sh -j                 JSON output to stdout
+#    bash linux_hardening_check.sh -q                 quiet (suppress banner)
+#    bash linux_hardening_check.sh -h                 help
+#
+#  Categories: ssh | firewall | kernel | users | services | files | logging
+#
+#  Exit codes: 0 = no findings, 1 = MEDIUM+, 2 = HIGH+, 3 = CRITICAL present
+# =============================================================================
+
+CATS="ssh firewall kernel users services files logging"
+SSH_CONFIG="/etc/ssh/sshd_config"
+
+PASS=0; FAIL=0; SSCORE=0; TOTAL=0
+JSON_MODE=0; QUIET=0; SEV_FILTER=""; SELECTED=(); EXIT=0
+
+# severity pass/fail tally (for summary)
+S_CR_P=0; S_CR_T=0; S_HI_P=0; S_HI_T=0; S_ME_P=0; S_ME_T=0; S_LO_P=0; S_LO_T=0
+
+# ---- argument parsing -------------------------------------------------------
+usage() { sed -n '1,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--modules) IFS=',' read -ra SELECTED <<< "$2"; shift 2 ;;
+    -s|--severity) SEV_FILTER="${2^^}"; shift 2 ;;
+    -j|--json) JSON_MODE=1; shift ;;
+    -q|--quiet) QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 64 ;;
+  esac
+done
+
+# ---- colors ----------------------------------------------------------------
+if [ -t 1 ]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; N=$'\e[0m'; BD=$'\e[1m'
+else
+  R=""; G=""; Y=""; B=""; N=""; BD=""
+fi
+
+# ---- output helpers ---------------------------------------------------------
+J_RESULT='{"category":"%s","id":%s,"severity":"%s","name":"%s","expected":"%s","actual":"%s","status":"%s"}'
+
+_sev_tally() {  # tally severity pass/fail counters
+  case "$1" in
+    CRITICAL) S_CR_T=$((S_CR_T+1)); [ "$2" = "PASS" ] && S_CR_P=$((S_CR_P+1)) ;;
+    HIGH)     S_HI_T=$((S_HI_T+1)); [ "$2" = "PASS" ] && S_HI_P=$((S_HI_P+1)) ;;
+    MEDIUM)   S_ME_T=$((S_ME_T+1)); [ "$2" = "PASS" ] && S_ME_P=$((S_ME_P+1)) ;;
+    LOW|INFO) S_LO_T=$((S_LO_T+1)); [ "$2" = "PASS" ] && S_LO_P=$((S_LO_P+1)) ;;
+  esac
+}
+
+_sev_reported() {  # severity filters
+  case "${SEV_FILTER}" in
+    "") return 0 ;;
+    CRITICAL) [ "$1" = "CRITICAL" ] && return 0 ;;
+    HIGH) case "$1" in CRITICAL|HIGH) return 0 ;; esac ;;
+    MEDIUM) case "$1" in CRITICAL|HIGH|MEDIUM) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+emit() {  # emit <cat> <id> <sev> <name> <expected> <actual> <status>
+  local st="$7"
+  TOTAL=$((TOTAL+1))
+  _sev_tally "$3" "$st"
+  [ "$st" = "PASS" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+  if [ "$JSON_MODE" -eq 1 ]; then
+    printf "$J_RESULT\n" "$1" "$2" "$3" "$4" "$5" "$6" "$st"
+    return 0
+  fi
+  _sev_reported "$3" || return 0
+  if [ "$st" = "PASS" ]; then
+    printf '  %sPASS %s%s  %s\n' "$G" "[$3]" "$N" "$4"
+  else
+    printf '  %sFAIL %s%s  %s\n' "$R" "[$3]" "$N" "$4"
+    printf '  %sExpected: %s%s\n' "$BD" "$5" "$N"
+    printf '  %sActual:   %s%s\n' "$BD" "$6" "$N"
+  fi
+  return 0
+}
+
+section() {  # section <cat> <label>
+  [ "$JSON_MODE" -eq 1 ] && return 0
+  printf '\n%s[%s-] %s%s\n' "$BD" "${1^^}" "$2" "$N"
+  printf '%s─%s\n' "$BD" "$N"
+}
+section_end() {  # section_end <count>
+  [ "$JSON_MODE" -eq 1 ] && return 0
+  printf '%s└─── %s checks%s\n' "$BD" "$1" "$N"
+}
+
+# ---- environment helpers ---------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+sshd_T() { if have sshd; then sshd -T 2>/dev/null; fi; }
+
+# =============================================================================
+#  SSH
+# =============================================================================
+check_ssh() {
+  local T; T="$(sshd_T)"
+  local n=0
+  section ssh "SSH Configuration"
+  local v
+
+  v="$(printf '%s\n' "$T" | awk '$1=="passwordauthentication"{print $2}')"
+  emit ssh 1 CRITICAL "PasswordAuthentication disabled" "no" "${v:-unset}" \
+       "$([ "$v" = "no" ] || [ "$v" = "NO" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="permitrootlogin"{print $2}')"
+  [ -z "$v" ] && v="yes"
+  emit ssh 2 CRITICAL "PermitRootLogin disabled" "no" "$v" \
+       "$([ "$v" = "no" ] || [ "$v" = "prohibit-password" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="permitemptypasswords"{print $2}')"
+  emit ssh 3 HIGH "PermitEmptyPasswords disabled" "no" "${v:-unset}" \
+       "$([ "$v" = "no" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="x11forwarding"{print $2}')"
+  emit ssh 4 MEDIUM "X11Forwarding disabled" "no" "${v:-unset}" \
+       "$([ "$v" = "no" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="maxauthtries"{print $2}')"
+  emit ssh 5 HIGH "MaxAuthTries <= 4" "<= 4" "${v:-unset}" \
+       "$([ -n "$v" ] && [ "$v" -le 4 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="clientaliveinterval"{print $2}')"
+  emit ssh 6 MEDIUM "ClientAliveInterval 300-600" "300-600" "${v:-unset}" \
+       "$([ -n "$v" ] && [ "$v" -ge 300 ] 2>/dev/null && [ "$v" -le 600 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="clientalivecountmax"{print $2}')"
+  emit ssh 7 MEDIUM "ClientAliveCountMax <= 3" "<= 3" "${v:-unset}" \
+       "$([ -n "$v" ] && [ "$v" -le 3 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="logingracetime"{print $2}')"
+  emit ssh 8 MEDIUM "LoginGraceTime <= 60" "<= 60" "${v:-unset}" \
+       "$([ -n "$v" ] && [ "$v" -le 60 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="allowtcpforwarding"{print $2}')"
+  emit ssh 9 MEDIUM "AllowTcpForwarding disabled" "no" "${v:-unset}" \
+       "$([ "$v" = "no" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="allowagentforwarding"{print $2}')"
+  emit ssh 10 LOW "AllowAgentForwarding disabled" "no" "${v:-unset}" \
+       "$([ "$v" = "no" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="maxsessions"{print $2}')"
+  emit ssh 11 LOW "MaxSessions <= 4" "<= 4" "${v:-unset}" \
+       "$([ -n "$v" ] && [ "$v" -le 4 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="maxstartups"{print $2}')"
+  emit ssh 12 MEDIUM "MaxStartups configured" "10:30:60" "${v:-unset}" \
+       "$([ -n "$v" ] && [ "$v" != "10:30:100" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(printf '%s\n' "$T" | awk '$1=="banner"{print $2}')"
+  emit ssh 13 LOW "Login banner configured" "/etc/issue.net" "${v:-none}" \
+       "$([ -n "$v" ] && [ -f "$v" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # weak ciphers / MACs / KEX
+  local ciphers macs kex
+  ciphers="$(printf '%s\n' "$T" | awk '$1=="ciphers"{print $2}')"
+  macs="$(printf '%s\n' "$T" | awk '$1=="macs"{print $2}')"
+  kex="$(printf '%s\n' "$T" | awk '$1=="kexalgorithms"{print $2}')"
+
+  case "$ciphers" in
+    *aes128-cbc*|*aes256-cbc*|*3des-cbc*|*blowfish-cbc*|*arcfour*|*cast128-cbc*)
+      emit ssh 14 INFO "No weak ciphers" "cbc/legacy absent" "weak cipher(s) present" "FAIL" ;;
+    *) emit ssh 14 INFO "No weak ciphers" "cbc/legacy absent" "${ciphers:-unset}" "PASS" ;;
+  esac; n=$((n+1))
+
+  case "$macs" in
+    *md5*|*hmac-sha1*|*umac-64*|*ripemd160*)
+      emit ssh 15 INFO "No weak MACs" "md5/sha1 absent" "weak MAC(s) present" "FAIL" ;;
+    *) emit ssh 15 INFO "No weak MACs" "md5/sha1 absent" "${macs:-unset}" "PASS" ;;
+  esac; n=$((n+1))
+
+  case "$kex" in
+    *diffie-hellman-group1*|*diffie-hellman-group14-sha1*|*diffie-hellman-group-exchange-sha1*)
+      emit ssh 16 INFO "No weak key exchange" "sha1 kex absent" "weak kex present" "FAIL" ;;
+    *) emit ssh 16 INFO "No weak key exchange" "sha1 kex absent" "${kex:-unset}" "PASS" ;;
+  esac; n=$((n+1))
+
+  # host key permissions
+  local hkbad=0; local kf; local hkperm=""
+  for kf in /etc/ssh/ssh_host_*_key; do
+    [ -e "$kf" ] || continue
+    p="$(stat -c '%a' "$kf" 2>/dev/null)"
+    hkperm="$p"
+    case "$p" in 600|400|440|000) ;; *) hkbad=1 ;; esac
+  done
+  emit ssh 17 HIGH "SSH host key permissions <= 600" "600/400/440/000" "${hkperm:-none}" \
+       "$([ "$hkbad" -eq 0 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  emit ssh 18 MEDIUM "ED25519 host key present" "present" "$([ -f /etc/ssh/ssh_host_ed25519_key ] && echo present || echo absent)" \
+       "$([ -f /etc/ssh/ssh_host_ed25519_key ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  Firewall
+# =============================================================================
+check_firewall() {
+  local n=0
+  section firewall "Firewall & Network"
+  local nft=""; have nft && nft="$(nft list ruleset 2>/dev/null)"
+  local ipt=""; have iptables && ipt="$(iptables -S 2>/dev/null)"
+  local fw="no firewall"
+  [ -n "$nft" ] && fw="nftables"
+  [ -n "$ipt" ] && [ -z "$nft" ] && fw="iptables"
+
+  local v
+  v="no firewall"
+  if [ -n "$ipt" ]; then v="$(printf '%s\n' "$ipt" | awk '$1=="-P" && $2=="INPUT"{print $3}')"; fi
+  if [ -n "$nft" ]; then v="$(printf '%s\n' "$nft" | awk '$1=="policy"{print $2}' | head -n1)"; fi
+  emit firewall 1 CRITICAL "INPUT chain policy is DROP" "DROP" "$v" \
+       "$([ "$v" = "DROP" ] || [ "$v" = "drop" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no firewall"
+  if [ -n "$ipt" ]; then v="$(printf '%s\n' "$ipt" | awk '$1=="-P" && $2=="OUTPUT"{print $3}')"; fi
+  emit firewall 2 MEDIUM "OUTPUT chain policy configured" "DROP/REJECT" "$v" \
+       "$([ "$v" = "DROP" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # ESTABLISHED/RELATED
+  local est=0
+  if [ -n "$nft" ] && printf '%s\n' "$nft" | grep -qE "estab.*related|ct state established"; then est=1; fi
+  if [ -n "$ipt" ] && printf '%s\n' "$ipt" | grep -q -- "-m conntrack --ctstate ESTABLISHED,RELATED"; then est=1; fi
+  emit firewall 3 HIGH "ESTABLISHED/RELATED accepted" "yes" "$([ "$est" -eq 1 ] && echo yes || echo no)" \
+       "$([ "$est" -eq 1 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # SSH restricted
+  local ssh_open=0
+  if [ -n "$nft" ] && printf '%s\n' "$nft" | grep -qE "tcp dport (22|sshd).*accept"; then ssh_open=1; fi
+  if [ -n "$ipt" ] && printf '%s\n' "$ipt" | grep -qE -- "-p tcp --dport (22|sshd).*-j ACCEPT( -s 0.0.0.0)?"; then ssh_open=1; fi
+  emit firewall 4 HIGH "SSH not open to 0.0.0.0/0" "restricted" "$([ "$ssh_open" -eq 1 ] && echo anywhere || echo restricted/none)" \
+       "$([ "$ssh_open" -eq 0 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local icmp_lim=0
+  if [ -n "$nft" ] && printf '%s\n' "$nft" | grep -q "limit rate"; then icmp_lim=1; fi
+  emit firewall 5 MEDIUM "ICMP rate limiting" "limited" "$([ "$icmp_lim" -eq 1 ] && echo limited || echo not\ limited)" \
+       "$([ "$icmp_lim" -eq 1 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local drop_log=0
+  if [ -n "$nft" ] && printf '%s\n' "$nft" | grep -q "log prefix"; then drop_log=1; fi
+  if [ -n "$ipt" ] && printf '%s\n' "$ipt" | grep -q "\-j LOG"; then drop_log=1; fi
+  emit firewall 6 MEDIUM "Drop logging configured" "LOG target" "$([ "$drop_log" -eq 1 ] && echo configured || echo not\ configured)" \
+       "$([ "$drop_log" -eq 1 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="unknown"
+  if [ -n "$ipt" ]; then v="$(printf '%s\n' "$ipt" | awk '$1=="-P" && $2=="FORWARD"{print $3}')"; fi
+  emit firewall 7 MEDIUM "FORWARD chain policy is DROP" "DROP" "$v" \
+       "$([ "$v" = "DROP" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local wl=0
+  if have ss; then
+    wl="$(ss -tlnH 2>/dev/null | awk '$4 ~ /\*:|0\.0\.0\.0:|:::/' | wc -l)"
+  elif have netstat; then
+    wl="$(netstat -tln 2>/dev/null | awk '$4 ~ /\*:|0\.0\.0\.0:|:::/' | wc -l)"
+  fi
+  emit firewall 8 HIGH "Minimal wildcard listeners" "<= 3" "$wl found" \
+       "$([ -n "$wl" ] && [ "$wl" -le 3 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local smb=0
+  if have ss; then
+    smb="$(ss -tlnH 2>/dev/null | awk '$4 ~ /:(139|445)$/' | wc -l)"
+  fi
+  emit firewall 9 CRITICAL "SMB not exposed on 0.0.0.0" "not exposed" "$smb listeners" \
+       "$([ -n "$smb" ] && [ "$smb" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local inv=""
+  if have ss; then inv="$(ss -tln 2>/dev/null | awk 'NR>1 {gsub(/:.*/,"",$4); printf "%s ", $4}')"; fi
+  emit firewall 10 INFO "Ports inventory" "-" "$([ -n "$inv" ] && echo "$inv" || echo none)" "PASS"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  Kernel / Sysctl
+# =============================================================================
+check_kernel() {
+  local n=0
+  section kernel "Kernel & Sysctl"
+  local v
+  sys_get() { sysctl -n "$1" 2>/dev/null; }
+
+  v="$(sys_get kernel.randomize_va_space)"
+  emit kernel 1 CRITICAL "ASLR enabled (2)" "2" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 2 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.ip_forward)"
+  emit kernel 2 MEDIUM "IP forwarding disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.conf.all.accept_source_route)"
+  emit kernel 3 HIGH "IPv4 source routing disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.conf.all.accept_redirects)"
+  emit kernel 4 HIGH "IPv4 ICMP redirects disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.conf.all.send_redirects)"
+  emit kernel 5 HIGH "IPv4 send redirects disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.tcp_syncookies)"
+  emit kernel 6 HIGH "TCP SYN cookies enabled" "1" "$v" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.icmp_echo_ignore_broadcasts)"
+  emit kernel 7 MEDIUM "ICMP broadcast echo ignored" "1" "$v" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.icmp_ignore_bogus_error_responses)"
+  emit kernel 8 MEDIUM "Bogus ICMP responses ignored" "1" "$v" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.conf.all.log_martians)"
+  emit kernel 9 HIGH "Martian logging enabled" "1" "$v" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv6.conf.all.accept_redirects)"
+  emit kernel 10 HIGH "IPv6 redirects disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv6.conf.all.accept_source_route)"
+  emit kernel 11 HIGH "IPv6 source routing disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv6.conf.all.accept_ra)"
+  emit kernel 12 MEDIUM "IPv6 router advertisements off" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get net.ipv4.conf.all.rp_filter)"
+  emit kernel 13 HIGH "Reverse path filtering on" "1 or 2" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get kernel.dmesg_restrict)"
+  emit kernel 14 MEDIUM "dmesg restricted" "1" "$v" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get kernel.kptr_restrict)"
+  emit kernel 15 MEDIUM "Kernel pointers hidden" "1 or 2" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get kernel.yama.ptrace_scope)"
+  emit kernel 16 MEDIUM "Yama ptrace scope >= 1" ">= 1" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get fs.suid_dumpable)"
+  emit kernel 17 HIGH "SUID core dumps disabled" "0" "$v" \
+       "$([ "$v" = "0" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(sys_get kernel.unprivileged_bpf_disabled)"
+  [ -z "$v" ] && v="n/a"
+  emit kernel 18 MEDIUM "Unprivileged BPF disabled" "1" "$v" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # NX / execute-shield
+  local nx="unknown"
+  grep -qw nx /proc/cpuinfo 2>/dev/null && nx="enabled"
+  emit kernel 19 HIGH "NX/Execute Shield" "enabled" "dmesg=$([ -r /proc/sys/kernel/dmesg_restrict ] && echo "$(sysctl -n kernel.dmesg_restrict)" || echo 0) exec-shield=$nx" \
+       "$([ "$nx" = "enabled" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # KASLR
+  local kaslr="not disabled"; grep -qw nokaslr /proc/cmdline 2>/dev/null && kaslr="disabled on cmdline"
+  emit kernel 20 HIGH "KASLR not disabled" "enabled" "$kaslr" \
+       "$([ "$kaslr" = "not disabled" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  Users & Authentication
+# =============================================================================
+check_users() {
+  local n=0
+  section users "User & Authentication"
+  local v
+
+  # root account state
+  local rootpw="no account"; local rf="$(awk -F: '$1=="root"{print $2}' /etc/shadow 2>/dev/null)"
+  case "$rf" in
+    "*"|"!"|"!*"|"!!"|"*!") rootpw="locked" ;;
+    "") rootpw="no password" ;;
+    *)  rootpw="has password" ;;
+  esac
+  emit users 1 HIGH "Root account locked/no password" "locked" "$rootpw" \
+       "$([ "$rootpw" = "locked" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(awk -F: '$3==0{print $1}' /etc/passwd | wc -l)"
+  emit users 2 CRITICAL "Only root has UID 0" "root only" "$v user(s)" \
+       "$([ "$v" -eq 1 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -E "^PASS_MAX_DAYS" /etc/login.defs | awk '{print $2}')"
+  emit users 3 HIGH "Password max age <= 90 days" "<= 90" "$v" \
+       "$([ -n "$v" ] && [ "$v" -le 90 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -E "^PASS_MIN_DAYS" /etc/login.defs | awk '{print $2}')"
+  emit users 4 MEDIUM "Password min age >= 1" ">= 1" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -E "^PASS_MIN_LEN" /etc/login.defs | awk '{print $2}')"
+  emit users 5 HIGH "Password min length >= 12" ">= 12" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 12 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -E "^PASS_WARN_AGE" /etc/login.defs | awk '{print $2}')"
+  emit users 6 MEDIUM "Password warning >= 7 days" ">= 7" "$v" \
+       "$([ -n "$v" ] && [ "$v" -ge 7 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(awk -F: '($2==""){print $1}' /etc/shadow | wc -l)"
+  emit users 7 CRITICAL "No empty passwords" "0" "$v user(s)" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -rE "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | wc -l)"
+  emit users 8 HIGH "No NOPASSWD sudo" "none" "$v match(es)" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; grep -rqsE "^\s*Defaults.*use_pty" /etc/sudoers /etc/sudoers.d/ 2>/dev/null && v="yes"
+  emit users 9 MEDIUM "Sudo use_pty enabled" "Defaults use_pty" "$([ "$v" = "yes" ] && echo enabled || echo no)" \
+       "$([ "$v" = "yes" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; grep -rqsE "^\s*Defaults.*logfile|^\s*Defaults.*log_input|^\s*Defaults.*log_output" /etc/sudoers /etc/sudoers.d/ 2>/dev/null && v="yes"
+  emit users 10 MEDIUM "Sudo logging" "logfile configured" "$([ "$v" = "yes" ] && echo enabled || echo no)" \
+       "$([ "$v" = "yes" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -rhE "^\s*Defaults.*timestamp_timeout" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -oE "[0-9]+" | head -n1)"
+  [ -z "$v" ] && v=15
+  emit users 11 MEDIUM "Sudo timeout <= 5 min" "<= 5" "$v" \
+       "$([ "$v" -le 5 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; grep -rqs "pam_faillock\|pam_tally2" /etc/pam.d/ 2>/dev/null && v="yes"
+  emit users 12 HIGH "Account lockout configured" "pam_faillock/tally2" "$([ "$v" = "yes" ] && echo configured || echo no)" \
+       "$([ "$v" = "yes" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; grep -rqs "pam_pwquality\|pam_cracklib" /etc/pam.d/ 2>/dev/null && v="yes"
+  emit users 13 HIGH "Password complexity module" "pam_pwquality/cracklib" "$([ "$v" = "yes" ] && echo configured || echo no)" \
+       "$([ "$v" = "yes" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -E "^UMASK" /etc/login.defs | awk '{print $2}')"
+  emit users 14 MEDIUM "Umask 027 or stricter" "027/077" "$v" \
+       "$([ "$v" = "027" ] || [ "$v" = "077" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # home dirs
+  local homes_bad=0; local p
+  while IFS=: read -r u h; do
+    [ -d "$h" ] || continue
+    p="$(stat -c '%a' "$h" 2>/dev/null)"
+    [ -n "$p" ] && [ $(( ${p: -1} & 2 )) -ne 0 ] && homes_bad=$((homes_bad+1))
+  done < <(awk -F: '($3>=1000){print $1":"$6}' /etc/passwd)
+  emit users 15 HIGH "Home dirs not world-readable" "o-rx" "${homes_bad} bad" \
+       "$([ "$homes_bad" -eq 0 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # .ssh perms
+  local ssh_bad=0
+  while IFS=: read -r u h; do
+    [ -d "$h/.ssh" ] || continue
+    p="$(stat -c '%a' "$h/.ssh" 2>/dev/null)"
+    [ -n "$p" ] && [ "$p" != "700" ] && [ "$p" != "600" ] && ssh_bad=$((ssh_bad+1))
+  done < <(awk -F: '($3>=1000){print $1":"$6}' /etc/passwd)
+  emit users 16 HIGH ".ssh dirs are 700" "700" "$ssh_bad bad" \
+       "$([ "$ssh_bad" -eq 0 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  # authorized_keys perms
+  local ak_bad=0
+  while IFS=: read -r u h; do
+    [ -f "$h/.ssh/authorized_keys" ] || continue
+    p="$(stat -c '%a' "$h/.ssh/authorized_keys" 2>/dev/null)"
+    [ -n "$p" ] && [ "$p" != "600" ] && [ "$p" != "400" ] && ak_bad=$((ak_bad+1))
+  done < <(awk -F: '($3>=1000){print $1":"$6}' /etc/passwd)
+  emit users 17 HIGH "authorized_keys are 600" "600" "$ak_bad bad" \
+       "$([ "$ak_bad" -eq 0 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(find /home -name .rhosts -o -name .shosts 2>/dev/null | wc -l)"
+  emit users 18 HIGH "No .rhosts files" "none" "$v found" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  Services & Packages
+# =============================================================================
+check_services() {
+  local n=0
+  section services "Services & Packages"
+  local v
+
+  v="inactive"; svc_active unattended-upgrades && v="active"
+  emit services 1 HIGH "Unattended upgrades active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -h "Unattended-Upgrade" /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null | awk '{print $2}' | tr -d ';"')"
+  emit services 2 HIGH "Auto-update configured" "\"1\"" "${v:-not configured}" \
+       "$([ "$v" = "1" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="inactive"; svc_active fail2ban && v="active"
+  emit services 3 CRITICAL "Fail2ban active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="inactive"; svc_active auditd && v="active"
+  emit services 4 HIGH "Auditd active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="inactive"; svc_active rsyslog && v="active"
+  emit services 5 HIGH "Rsyslog active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="inactive"; svc_active apparmor && v="active"; [ -d /sys/kernel/security/apparmor ] && v="active"
+  emit services 6 HIGH "MAC framework active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="not installed"
+  if [ -e /var/run/docker.sock ]; then
+    v="$(stat -c '%a' /var/run/docker.sock 2>/dev/null)"
+    [ "$v" = "660" ] && v="root:docker 660"
+  fi
+  emit services 7 HIGH "Docker socket perms" "root:docker 660" "$v" \
+       "$([ "${v%% *}" = "root:docker" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="not exposed"; ss -tlnH 2>/dev/null | grep -q "0.0.0.0:2375" && v="0.0.0.0:2375"
+  emit services 8 CRITICAL "Docker daemon not on 0.0.0.0:2375" "not exposed" "$v" \
+       "$([ "$v" = "not exposed" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"
+  if svc_active systemd-timesyncd || svc_active chrony || svc_active ntp || svc_active ntpd; then v="active"; fi
+  emit services 9 MEDIUM "NTP sync active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(systemctl --failed --no-legend 2>/dev/null | wc -l)"
+  emit services 10 MEDIUM "No failed services" "0" "$v unit(s)" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local sec=0
+  if have apt-get && [ -d /var/lib/apt/lists ]; then
+    sec="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst')"
+  fi
+  emit services 11 HIGH "No pending security updates" "none" "$sec pending" \
+       "$([ "$sec" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; [ -f /run/reboot-required ] || [ -f /var/run/reboot-required ] && v="yes"
+  emit services 12 HIGH "No reboot required" "not required" "$v" \
+       "$([ "$v" = "no" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  File permissions
+# =============================================================================
+check_files() {
+  local n=0
+  section files "File Permissions"
+  local v
+
+  v="$(findmnt -no OPTIONS /tmp 2>/dev/null)"
+  [ -z "$v" ] && v="$(awk '$2=="/tmp"{print $4}' /proc/mounts)"
+  emit files 1 HIGH "/tmp nosuid" "nosuid" "${v:-not mounted}" \
+       "$(printf '%s' "$v" | grep -q nosuid && echo PASS || echo FAIL)"; n=$((n+1))
+
+  emit files 2 HIGH "/tmp nodev" "nodev" "${v:-not mounted}" \
+       "$(printf '%s' "$v" | grep -q nodev && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(find / -xdev -type f -perm -4000 2>/dev/null | wc -l)"
+  emit files 3 HIGH "No unexpected SUID binaries" "baseline" "$v found" \
+       "$([ "$v" -le 30 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(find / -xdev -type f -perm -0002 2>/dev/null | wc -l)"
+  emit files 4 HIGH "No world-writable files" "0" "$v found" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(find / -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null | wc -l)"
+  emit files 5 MEDIUM "No world-writable dirs" "0" "$v found" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local crit=0
+  for f in /etc/passwd /etc/shadow /etc/gshadow /etc/sudoers /etc/crontab; do
+    [ -e "$f" ] || continue
+    p="$(stat -c '%a' "$f" 2>/dev/null)"
+    case "$f" in
+      /etc/passwd) [ "$p" = "644" ] || crit=1 ;;
+      /etc/shadow|/etc/gshadow) case "$p" in 640|600|000|400) ;; *) crit=1 ;; esac ;;
+      *) case "$p" in 440|400|600) ;; *) crit=1 ;; esac ;;
+    esac
+  done
+  emit files 6 HIGH "Critical file perms correct" "standard" "$crit bad" \
+       "$([ "$crit" -eq 0 ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(find / -xdev \( -nouser -o -nogroup \) 2>/dev/null | wc -l)"
+  emit files 7 MEDIUM "No unowned files" "0" "$v found" \
+       "$([ "$v" -eq 0 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  Logging & Audit
+# =============================================================================
+check_logging() {
+  local n=0
+  section logging "Logging & Audit"
+  local v
+
+  v="inactive"; svc_active rsyslog && v="active"
+  emit logging 1 HIGH "Rsyslog active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="volatile"; [ -d /var/log/journal ] && v="persistent"
+  emit logging 2 MEDIUM "Journal storage" "persistent" "$v" \
+       "$([ "$v" = "persistent" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="inactive"; svc_active auditd && v="active"
+  emit logging 3 HIGH "Auditd active" "active" "$v" \
+       "$([ "$v" = "active" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v=0; have auditctl && v="$(auditctl -l 2>/dev/null | wc -l)"
+  emit logging 4 HIGH "Audit rules loaded" ">= 1 rule" "$v rules" \
+       "$([ "${v:-0}" -ge 1 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="not found"; v="$(sysctl -n kernel.auditd_backlog_limit 2>/dev/null)"
+  [ -z "$v" ] && v="not found"
+  emit logging 5 MEDIUM "Audit backlog configured" "set" "$v" \
+       "$([ "$v" != "not found" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  local mon=0
+  if have auditctl; then
+    mon="$(auditctl -l 2>/dev/null | grep -cE 'passwd|shadow|sudoers|sshd_config')"
+  else
+    mon="$(grep -rE '/etc/(passwd|shadow|sudoers)' /etc/audit/rules.d/ 2>/dev/null | wc -l)"
+  fi
+  emit logging 6 HIGH "Critical files audited" ">= 2 files" "$mon monitored" \
+       "$([ "${mon:-0}" -ge 2 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; [ -d /etc/logrotate.d ] && v="configured"
+  emit logging 7 MEDIUM "Logrotate configured" "yes" "$v" \
+       "$([ "$v" = "configured" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="disabled"; grep -qsE "^\s*compress" /etc/logrotate.conf /etc/logrotate.d/* 2>/dev/null && v="enabled"; true
+  emit logging 8 LOW "Logrotate compression" "compress" "$v" \
+       "$([ "$v" = "enabled" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="$(grep -E "^\s*rotate" /etc/logrotate.conf 2>/dev/null | awk '{print $2}')"
+  emit logging 9 LOW "Log retention >= 4" ">= 4" "${v:-unknown}" \
+       "$([ -n "$v" ] && [ "$v" -ge 4 ] 2>/dev/null && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="no"; grep -rhqE "@(host|server)" /etc/rsyslog.d/ /etc/rsyslog.conf 2>/dev/null && v="configured"
+  emit logging 10 MEDIUM "Remote syslog" "@server configured" "$v" \
+       "$([ "$v" = "configured" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  v="missing"
+  [ -e /var/log/auth.log ] || [ -e /var/log/secure ] && v="exists"
+  emit logging 11 HIGH "Auth log exists" "auth.log/secure" "$v" \
+       "$([ "$v" = "exists" ] && echo PASS || echo FAIL)"; n=$((n+1))
+
+  section_end "$n"
+}
+
+# =============================================================================
+#  Runner / summary
+# =============================================================================
+banner() {
+  [ "$JSON_MODE" -eq 1 ] || [ "$QUIET" -eq 1 ] && return 0
+  printf '%s\n' "$BD==============================================================$N"
+  printf '%s\n' "$BD          Linux Hardening Assessment Tool (Bash)$N"
+  printf '%s\n' "$BD          Security Posture Scanner v1.0$N"
+  printf '%s\n' "$BD==============================================================$N"
+  printf '  Target: %s\n  Time:   %s\n' "$(hostname 2>/dev/null || echo unknown)" "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+run_cats() {
+  local cat
+  for cat in "${SELECTED[@]}"; do
+    case "$cat" in
+      ssh) check_ssh ;;
+      firewall) check_firewall ;;
+      kernel) check_kernel ;;
+      users) check_users ;;
+      services) check_services ;;
+      files) check_files ;;
+      logging) check_logging ;;
+      *) echo "unknown category: $cat" >&2 ;;
+    esac
+  done
+}
+
+sev_bar() {  # sev_bar <pass> <total>
+  local p="$1" t="$2"; [ "$t" -eq 0 ] && { printf '  '; return; }
+  local filled=$(( p * 10 / t )); [ "$filled" -lt 1 ] && [ "$p" -gt 0 ] && filled=1
+  printf '%s' "$BD"
+  printf '█%.0s' $(seq 1 "$filled" 2>/dev/null)
+  printf '░%.0s' $(seq 1 $((10 - filled)) 2>/dev/null)
+  printf '%s  %d/%d passed\n' "$N" "$p" "$t"
+}
+
+summary() {
+  local score=0
+  if [ "$TOTAL" -gt 0 ]; then
+    score=$((PASS*100/TOTAL))
+    local rem=$((PASS*100 % TOTAL)); [ "$rem" -ge 5 ] && score=$((score+1))
+  fi
+  SSCORE=$score
+
+  if [ "$JSON_MODE" -eq 1 ]; then
+    printf '{"host":"%s","time":"%s","score":%s,"passed":%s,"failed":%s,"total":%s}\n' \
+      "$(hostname 2>/dev/null)" "$(date -Iseconds)" "$score" "$PASS" "$FAIL" "$TOTAL"
+    return 0
+  fi
+
+  local grade="F"
+  [ "$score" -ge 90 ] && grade="A"
+  [ "$score" -ge 75 ] && grade="B"
+  [ "$score" -ge 60 ] && grade="C"
+  [ "$score" -ge 50 ] && grade="D"
+  local col="$R"; [ "$score" -ge 60 ] && col="$Y"; [ "$score" -ge 90 ] && col="$G"
+
+  printf '\n%s\n' "$BD==============================================================$N"
+  printf '%s\n' "$BD                    ASSESSMENT SUMMARY$N"
+  printf '%s\n' "$BD==============================================================$N"
+  printf '  %sOverall Score:  %s%d/100  [%s]%s\n' "$BD" "$col" "$score" "$grade" "$N"
+  printf '\n  Results:  %d passed | %d failed | %d total\n\n' "$PASS" "$FAIL" "$TOTAL"
+
+  printf '  By Severity:\n'
+  printf '    CRITICAL  '; sev_bar "$S_CR_P" "$S_CR_T"
+  printf '    HIGH      '; sev_bar "$S_HI_P" "$S_HI_T"
+  printf '    MEDIUM    '; sev_bar "$S_ME_P" "$S_ME_T"
+  printf '    LOW       '; sev_bar "$S_LO_P" "$S_LO_T"
+
+  EXIT=0
+  [ -n "$SEV_FILTER" ] && return 0
+  if [ "$S_CR_P" -lt "$S_CR_T" ]; then EXIT=3
+  elif [ "$S_HI_P" -lt "$S_HI_T" ]; then EXIT=2
+  elif [ "$S_ME_P" -lt "$S_ME_T" ]; then EXIT=1
+  fi
+}
+
+# ---- main -------------------------------------------------------------------
+banner
+[ ${#SELECTED[@]} -eq 0 ] && SELECTED=(ssh firewall kernel users services files logging)
+run_cats
+summary
+exit "$EXIT"
