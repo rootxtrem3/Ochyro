@@ -1,0 +1,13 @@
+# backups of hardening runs
+.harden-backups/
+backups/
+rollback_*.sh
+rollback_*.ps1
+
+# logs
+*.log
+harden_*.log
+
+# OS noise
+.DS_Store
+Thumbs.db
