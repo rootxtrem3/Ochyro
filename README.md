@@ -44,8 +44,16 @@ bash linux_harden.sh --apply-all
 bash linux_harden.sh --dry-run
 ```
 
-Every change is recorded; a rollback script is generated alongside the
-timestamped backups under `~/.harden-backups/`.
+### Remote deploy
+
+```bash
+./deploy_harden.sh user@host --dry-run   # preview on the remote host
+SSH_PASS='...' ./deploy_harden.sh user@host
+./deploy_harden.sh -w winadmin@host      # Windows target
+```
+
+The target address, username, port and password are provided at runtime -
+the scripts never embed host-specific values.
 
 ## Design principles
 
