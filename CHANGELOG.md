@@ -1,4 +1,4 @@
-# Changelog
+# Ochyro - Changelog
 
 All notable changes to this project. Dates follow the commit history.
 

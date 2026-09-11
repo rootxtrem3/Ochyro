@@ -1,4 +1,4 @@
-# hardening-tools
+# Ochyro
 
 Security posture scanners and interactive hardening scripts for Linux and Windows.
 
