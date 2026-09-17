@@ -198,26 +198,36 @@ function Check-User {
     # 4. Password policy
     $netAccounts = net accounts 2>$null
     if ($netAccounts) {
-        $maxAge = ($netAccounts | Select-String "Maximum password age").ToString().Split()[-2]
-        $minAge = ($netAccounts | Select-String "Minimum password age").ToString().Split()[-2]
-        $minLen = ($netAccounts | Select-String "Minimum password length").ToString().Split()[-2]
-        $lockout = ($netAccounts | Select-String "Lockout threshold").ToString().Split()[-1]
-        
-        $maxAgeNum = [int]($maxAge -replace '[^\d]','')
+
+        function Get-NetAccountsField {
+            param([string]$Pattern, [int]$Idx = -1)
+            $m = $netAccounts | Select-String -Pattern $Pattern
+            if (-not $m) { return "" }
+            $tokens = $m[0].Line -split '\s+'
+            if ($tokens.Count -eq 0) { return "" }
+            $val = if ($Idx -lt 0) { $tokens[$tokens.Count - 1] } else { $tokens[[Math]::Min($Idx, $tokens.Count - 1)] }
+            return $val
+        }
+
+        $maxAgeNum  = [int]((Get-NetAccountsField "Maximum password age" -2) -replace '[^\d]','')
         Write-Check "Password max age <= 90 days" ($maxAgeNum -le 90 -and $maxAgeNum -gt 0) "<= 90" "${maxAgeNum} days" "HIGH"
-        
-        $minLenNum = [int]($minLen -replace '[^\d]','')
+
+        $minLenNum  = [int]((Get-NetAccountsField "Minimum password length") -replace '[^\d]','')
         Write-Check "Password min length >= 12" ($minLenNum -ge 12) ">= 12" "$minLenNum characters" "HIGH"
-        
-        $lockoutNum = [int]($lockout -replace '[^\d]','')
+
+        $lockoutNum = [int]((Get-NetAccountsField "Lockout threshold") -replace '[^\d]','')
         Write-Check "Account lockout threshold <= 10" ($lockoutNum -le 10 -and $lockoutNum -gt 0) "<= 10" "$lockoutNum attempts" "HIGH"
-        
-        $minAgeNum = [int]($minAge -replace '[^\d]','')
+
+        $minAgeNum  = [int]((Get-NetAccountsField "Minimum password age" -2) -replace '[^\d]','')
         Write-Check "Password min age >= 1" ($minAgeNum -ge 1) ">= 1" "${minAgeNum} days" "MEDIUM"
-        
+
         # 5. Password complexity
-        $complexity = ($netAccounts | Select-String "Password properties").ToString()
-        $complexOk = $complexity -match "Password complexity.*0x1" -or $complexity -match "1"
+        $complexity = (Get-NetAccountsField "Password properties") -replace '[^\d]',''
+        if ($complexity -ne "") {
+            $complexOk = ([Convert]::ToInt32($complexity) -band 0x1) -eq 0x1
+        } else {
+            $complexOk = $false
+        }
         Write-Check "Password complexity enabled" $complexOk "enabled" "$complexity" "HIGH"
     }
     
