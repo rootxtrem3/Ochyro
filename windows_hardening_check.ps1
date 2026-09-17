@@ -10,7 +10,9 @@
 .PARAMETER Severity
     Show only checks of this severity or higher
 .PARAMETER Json
-    Output as JSON
+    Output as JSON report
+.PARAMETER OutFile
+    Write the JSON report to a file (keeps console summary)
 .PARAMETER Quiet
     Show failures only
 .EXAMPLE
@@ -18,6 +20,7 @@
     .\windows_hardening_check.ps1 -Module firewall
     .\windows_hardening_check.ps1 -Severity HIGH
     .\windows_hardening_check.ps1 -Json
+    .\windows_hardening_check.ps1 -OutFile report.json
 #>
 param(
     [ValidateSet("firewall","user","services","registry","smb","audit","defender","all")]
@@ -25,6 +28,7 @@ param(
     [ValidateSet("CRITICAL","HIGH","MEDIUM","LOW","INFO")]
     [string]$Severity = "",
     [switch]$Json,
+    [string]$OutFile = "",
     [switch]$Quiet
 )
 
@@ -37,6 +41,7 @@ $script:Passed = 0
 $script:Failed = 0
 $script:Results = @()
 $script:Failures = @()
+$script:CurrentModule = "all"
 
 $SeverityWeights = @{
     "CRITICAL" = 10
@@ -53,6 +58,7 @@ function Write-Check {
     param([string]$Name, [bool]$Passed, [string]$Expected, [string]$Actual, [string]$Severity = "HIGH")
     
     $script:TotalChecks++
+    $Fix = $FixMap[$Name]
     
     if ($Passed) {
         $script:Passed++
@@ -67,8 +73,12 @@ function Write-Check {
         expected = $Expected
         actual = $Actual
         severity = $Severity
+        module = $script:CurrentModule
+        fix = $Fix
     }
-    
+
+    if ($Json) { return }
+
     if (-not $Quiet -or -not $Passed) {
         $colors = @{
             "CRITICAL" = "Red"
@@ -88,8 +98,17 @@ function Write-Check {
         if (-not $Passed) {
             Write-Host "         Expected: $Expected" -ForegroundColor DarkGray
             Write-Host "         Actual:   $Actual" -ForegroundColor DarkGray
+            if ($Fix) { Write-Host "         Fix:      $Fix" -ForegroundColor Green }
         }
     }
+}
+
+function Show-ModuleHeader {
+    param([string]$Label)
+    if ($Json) { return }
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
+    Write-Host " $Label" -ForegroundColor Cyan
+    Write-Host "$('═' * 60)" -ForegroundColor Cyan
 }
 
 function Test-RegistryValue {
@@ -114,13 +133,97 @@ function Test-ServiceEnabled {
     return ($svc -and $svc.StartType -ne "Disabled")
 }
 
+# --- suggested fixes (v2.0) --------------------------------------------------
+# keyed by exact check name as passed to Write-Check
+$FixMap = @{
+    # firewall
+    "All firewall profiles enabled"       = 'Enable all three profiles: Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True'
+    "Default inbound action is Block"     = 'Set-NetFirewallProfile -DefaultInboundAction Block -Profile Domain,Public,Private'
+    "Default outbound is Allow (restrictive)" = 'Consider a restrictive outbound default (Deny) with explicit per-application allow rules.'
+    "Firewall logging enabled"            = 'Set-NetFirewallProfile -LogAllowed True -LogBlocked True -LogFileName "%SystemRoot%\System32\LogFiles\Firewall\pfirewall.log"'
+    "Log size >= 16MB"                    = 'Set-NetFirewallProfile -LogMaxSizeKilobytes 16384 (16 MB or larger).'
+    "Firewall profiles accessible"        = 'Run from an elevated (administrator) PowerShell so the NetSecurity module can enumerate the profiles.'
+    "Inbound allow-all rules <= 5"        = 'Replace inbound allow-any rules with source-restricted rules (scope by CIDR/subnet).'
+    "RDP not open to Any"                 = 'Restrict the Remote Desktop rules to the management subnet (LocalAddress / RemoteAddress).'
+    "WinRM restricted"                    = 'Stop WinRM if unused (Disable-PSRemoting) or restrict it with firewall rules to management hosts.'
+
+    # user & password policy
+    "Guest account disabled"              = 'Disable-LocalUser -Name Guest'
+    "Default Administrator renamed"       = 'Rename (and disable) the built-in Administrator: Rename-LocalUser -Name Administrator -NewName "admn_<unique>" ; then Disable-LocalUser'
+    "No user named 'admin'"               = 'Disable or rename the "admin" account: Disable-LocalUser -Name admin'
+    "Password max age <= 90 days"         = 'net accounts /maxpwage:90'
+    "Password min length >= 12"           = 'net accounts /minpwlen:12'
+    "Account lockout threshold <= 10"     = 'net accounts /lockoutthreshold:10 /lockoutduration:30'
+    "Password min age >= 1"               = 'net accounts /minpwage:1'
+    "Password complexity enabled"         = 'Enable "Passwords must meet complexity requirements" in Local Security Policy or GPO.'
+    "Enabled local accounts <= 5"         = 'Disable unused local accounts: Disable-LocalUser -Name <user>'
+    "Administrators group <= 3"           = 'Remove unnecessary members: Remove-LocalGroupMember -Group Administrators -Member <user>'
+    "No accounts with 'password never expires'" = 'Clear the flag: Set-LocalUser -Name <user> -PasswordNeverExpires $false'
+    "No accounts inactive > 90 days"      = 'Disable or remove accounts inactive for more than 90 days.'
+
+    # services
+    "Windows Update active"               = 'Set-Service wuauserv -StartupType Automatic ; Start-Service wuauserv'
+    "Windows Defender active"             = 'Start the WinDefend service; ensure no conflicting third-party AV is installed.'
+    "Defender real-time protection"       = 'Set-MpPreference -DisableRealtimeMonitoring $false'
+    "Defender cloud protection"           = 'Set-MpPreference -DisableBehaviorMonitoring $false'
+    "Defender IOAV protection"            = 'Set-MpPreference -DisableIOAVProtection $false'
+    "Defender protection status"          = 'Ensure Defender is enabled (not disabled by GPO/registry) and the service is running.'
+    "No unnecessary services"             = 'Disable unnecessary services (RemoteRegistry, Telnet, SNMP, IIS, FTP, Internet Connection Sharing): Set-Service <name> -StartupType Disabled'
+    "Remote Desktop disabled"             = 'Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 1'
+    "PowerShell script block logging"     = 'Enable via GPO/registry: HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging = EnableScriptBlockLogging 1'
+    "PowerShell module logging"           = 'Enable via GPO/registry: ModuleLogging\EnableModuleLogging = 1'
+    "PowerShell Constrained Language"     = 'Enforce Constrained Language Mode via AppLocker / WDAC policy (Device Guard).'
+    "Attack Surface Reduction rules"      = 'Deploy ASR rules via Intune/GPO and enable ExploitGuard ASR policy.'
+
+    # registry
+    "UAC enabled"                         = 'Set EnableLUA=1 under HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    "UAC admin consent mode"              = 'Set ConsentPromptBehaviorAdmin=2 (prompt for consent on the secure desktop) under ...\Policies\System'
+    "UAC installer detection"             = 'Set EnableInstallerDetection=1 under ...\Policies\System'
+    "SMBv1 disabled"                      = 'Disable-SMB1Server (Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force ; or DISM /Disable-Feature:SMB1Protocol)'
+    "SMB signing required"                = 'Set-SmbServerConfiguration -RequireSecuritySignature $true -Force'
+    "SMB encryption"                      = 'Set-SmbServerConfiguration -EncryptData $true -Force'
+    "Restrict anonymous enumeration"      = 'Set RestrictAnonymous=1 and RestrictAnonymousSAM=1 under HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
+    "NTLMv2 only"                         = 'Set RestrictSendingNTLMTraffic=1 under HKLM\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0'
+    "LAN Manager hash disabled"           = 'Set NoLMHash=1 under HKLM\SYSTEM\CurrentControlSet\Control\Lsa'
+    "Audit base objects"                  = 'Set AuditBaseObjects=1 (Base Objects auditing) or rely on advanced audit policy.'
+    "Command Prompt restricted for std users" = 'Set DisableCMD=1 for standard users under HKLM\SOFTWARE\Policies\Microsoft\Windows\System'
+    "AutoPlay disabled"                   = 'Set NoDriveTypeAutoRun=255 (or 145) under HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    "Always Install Elevated disabled"    = 'Remove or set AlwaysInstallElevated=0 under HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer (and HKCU).'
+    "Credential Guard / VBS"              = 'Enable Virtualization-Based Security and Device Guard: EnableVirtualizationBasedSecurity=1 under ...\DeviceGuard, enable VBS in Windows Security.'
+
+    # smb
+    "SMBv1 protocol disabled"             = 'DISABLE SMBv1: DISM /Online /Disable-Feature:SMB1Protocol or Set-SmbServerConfiguration -EnableSMB1Protocol $false -Force'
+    "SMB configuration accessible"        = 'Run elevated; the SMB server module requires administrative rights.'
+    "Non-admin shares <= 3"               = 'Remove unused shares: Remove-SmbShare -Name <share> -Force'
+    "ADMIN$ share restricted"             = 'Ensure ADMIN$ is not exposed beyond administrators (it is hidden by default; do not remove it).'
+
+    # audit
+    "Audit covers most categories"        = 'auditpol /set /category:* /success:enable /failure:enable'
+    "Logon auditing (Success+Failure)"    = 'auditpol /set /subcategory:"Logon" /success:enable /failure:enable'
+    "Account management auditing"         = 'auditpol /set /subcategory:"Account Management" /success:enable /failure:enable'
+    "Policy change auditing"              = 'auditpol /set /subcategory:"Policy Change" /success:enable /failure:enable'
+    "Security log >= 1GB"                 = 'wevtutil sl Security /ms:1073741824 (1 GB)'
+    "Event log retention configured"      = 'wevtutil sl Security /rt:false /ab:true (no overwrite + autoBackup)'
+    "PowerShell transcript logging"       = 'Enable Transcription via GPO: EnableTranscripting=1 under ...\PowerShell\Transcription'
+
+    # defender
+    "Defender behavior monitoring"        = 'Enable behavior monitoring: Set-MpPreference -DisableBehaviorMonitoring $false'
+    "Defender NIS running"                = 'Enable Network Inspection System; do not disable via group policy.'
+    "Defender AM service running"         = 'Ensure the antimalware service runs; fix policies that disable WinDefend.'
+    "Signatures updated < 24h"            = 'Update definitions: Update-MpSignature (set cadence to 8 hours or less via policy).'
+    "Cloud-delivered protection"          = 'Enable cloud protection and automatic sample submission (Set-MpPreference -MAPS 1 -DisableRealtimeMonitoring $false).'
+    "Cloud block level"                   = 'Set-MpPreference -CloudBlockLevel 2 (High) or 6 (High Plus).'
+    "Tamper protection"                   = 'Enable tamper protection in Windows Security (Windows 10 1903+); not scriptable.'
+    "Defender exclusions <= 5"            = 'Review and trim unnecessary exclusions (ExclusionPath/Extension/Process).'
+    "Windows Defender available"          = 'Reinstall/enable Windows Defender or replace it with an actively managed third-party AV.'
+}
+
 # ============================================================================
 # MODULE: WINDOWS FIREWALL
 # ============================================================================
 function Check-Firewall {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [FW] Windows Firewall" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "firewall"
+    Show-ModuleHeader "[FW] Windows Firewall"
     
     # 1. All profiles enabled
     $fw = Get-NetFirewallProfile -ErrorAction SilentlyContinue
@@ -172,16 +275,15 @@ function Check-Firewall {
     $winrmActive = $winrm -and $winrm.Status -eq "Running"
     Write-Check "WinRM restricted" (-not $winrmActive) "not running" "$($winrm.Status)" "MEDIUM"
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
 # MODULE: USER & PASSWORD POLICY
 # ============================================================================
 function Check-User {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [USR] User & Authentication" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "user"
+    Show-ModuleHeader "[USR] User & Authentication"
     
     # 1. Guest account disabled
     $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
@@ -253,16 +355,15 @@ function Check-User {
     $staleCount = ($staleAccounts | Measure-Object).Count
     Write-Check "No accounts inactive > 90 days" ($staleCount -eq 0) "0 stale" "$staleCount stale accounts" "LOW"
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
 # MODULE: SERVICES
 # ============================================================================
 function Check-Services {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [SVC] Services & Features" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "services"
+    Show-ModuleHeader "[SVC] Services & Features"
     
     # 1. Windows Update service
     $wuActive = Test-ServiceActive "wuauserv"
@@ -313,16 +414,15 @@ function Check-Services {
     $asrRules = Test-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR" "ExploitGuard_ASR_Rules"
     Write-Check "Attack Surface Reduction rules" ($asrRules -eq 1) "enabled" "$(if ($asrRules -eq 1) {'enabled'} else {'disabled'})" "HIGH"
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
 # MODULE: REGISTRY HARDENING
 # ============================================================================
 function Check-Registry {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [REG] Registry Hardening" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "registry"
+    Show-ModuleHeader "[REG] Registry Hardening"
     
     # 1. UAC
     $uac = Test-RegistryValue "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "EnableLUA"
@@ -375,16 +475,15 @@ function Check-Registry {
     $credGuard = Test-RegistryValue "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" "EnableVirtualizationBasedSecurity"
     Write-Check "Credential Guard / VBS" ($credGuard -eq 1) "enabled" "$(if ($credGuard -ne $null) {$credGuard} else {'not set'})" "MEDIUM"
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
 # MODULE: SMB / FILE SHARING
 # ============================================================================
 function Check-SMB {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [SMB] File Sharing & Sharing" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "smb"
+    Show-ModuleHeader "[SMB] File Sharing & Sharing"
     
     # 1. SMBv1 protocol
     $smb1 = Get-SmbServerConfiguration -ErrorAction SilentlyContinue
@@ -414,16 +513,15 @@ function Check-SMB {
         Write-Check "ADMIN$ share restricted" ($adminShares.Description -ne "") "configured" "present" "LOW"
     }
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
 # MODULE: AUDIT POLICY
 # ============================================================================
 function Check-Audit {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [AUD] Audit Policy" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "audit"
+    Show-ModuleHeader "[AUD] Audit Policy"
     
     # 1. Audit policy
     $auditPol = auditpol /get /category:* 2>$null
@@ -467,16 +565,15 @@ function Check-Audit {
     $psTranscript = Test-RegistryValue "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" "EnableTranscripting"
     Write-Check "PowerShell transcript logging" ($psTranscript -eq 1) "enabled" "$(if ($psTranscript -eq 1) {'enabled'} else {'disabled'})" "LOW"
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
 # MODULE: WINDOWS DEFENDER
 # ============================================================================
 function Check-Defender {
-    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
-    Write-Host " [DEF] Windows Defender" -ForegroundColor Cyan
-    Write-Host "$('═' * 60)" -ForegroundColor Cyan
+    $script:CurrentModule = "defender"
+    Show-ModuleHeader "[DEF] Windows Defender"
     
     try {
         $mpStatus = Get-MpComputerStatus -ErrorAction Stop
@@ -516,7 +613,7 @@ function Check-Defender {
         Write-Check "Windows Defender available" $false "installed" "not found or access denied" "HIGH"
     }
     
-    Write-Host ("─" * 60) -ForegroundColor DarkGray
+    if (-not $Json) { Write-Host ("─" * 60) -ForegroundColor DarkGray }
 }
 
 # ============================================================================
@@ -602,7 +699,7 @@ if (-not $Json) {
     Write-Host ""
     Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
     Write-Host "║       Windows Hardening Assessment Tool (PowerShell)    ║" -ForegroundColor Cyan
-    Write-Host "║       Security Posture Scanner v1.0                     ║" -ForegroundColor Cyan
+    Write-Host "║       Security Posture Scanner v2.0                     ║" -ForegroundColor Cyan
     Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Target: $env:COMPUTERNAME" -ForegroundColor DarkGray
@@ -630,18 +727,50 @@ switch ($Module) {
 
 $stopwatch.Stop()
 
-if ($Json) {
-    $output = @{
+if ($Json -or $OutFile) {
+    $reportScore = [math]::Round($script:Passed * 100 / ([math]::Max($script:TotalChecks, 1)))
+    $reportLetter = switch ($reportScore) {
+        { $_ -ge 90 } { "A" }
+        { $_ -ge 75 } { "B" }
+        { $_ -ge 60 } { "C" }
+        { $_ -ge 40 } { "D" }
+        default       { "F" }
+    }
+    $reportModules = @{}
+    foreach ($m in @($script:Results | Select-Object -ExpandProperty module -Unique)) {
+        if ($m) { $reportModules[$m] = @($script:Results | Where-Object { $_.module -eq $m }) }
+    }
+    $reportBySev = @{}
+    foreach ($s in "CRITICAL","HIGH","MEDIUM","LOW","INFO") {
+        $r = @($script:Results | Where-Object { $_.severity -eq $s })
+        $reportBySev[$s] = @{
+            passed = @($r | Where-Object { $_.passed }).Count
+            total  = $r.Count
+        }
+    }
+    $reportObj = @{
+        tool = "windows_hardening_check.ps1"
+        version = "2.0"
         hostname = $env:COMPUTERNAME
         timestamp = (Get-Date -Format "yyyy-MM-ddTHH:mm:ss")
         elapsed_seconds = [math]::Round($stopwatch.Elapsed.TotalSeconds, 2)
+        score = $reportScore
+        grade = $reportLetter
         total = $script:TotalChecks
         passed = $script:Passed
         failed = $script:Failed
-        score = [math]::Round($script:Passed * 100 / ([math]::Max($script:TotalChecks, 1)))
+        by_severity = $reportBySev
+        modules = $reportModules
+        checks = @($script:Results)
         failures = $script:Failures
     }
-    $output | ConvertTo-Json -Depth 3
+    $reportJson = $reportObj | ConvertTo-Json -Depth 4
+    if ($OutFile) {
+        $reportJson | Set-Content -Path $OutFile -Encoding UTF8
+        Write-Host "Report written: $OutFile"
+    }
+    if ($Json) { Write-Output $reportJson }
+    if (-not $Json) { Show-Summary -Elapsed $stopwatch.Elapsed.TotalSeconds }
 } else {
     Show-Summary -Elapsed $stopwatch.Elapsed.TotalSeconds
 }

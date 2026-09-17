@@ -8,7 +8,8 @@
 #    bash linux_hardening_check.sh                    all categories
 #    bash linux_hardening_check.sh -m ssh,firewall    specific categories
 #    bash linux_hardening_check.sh -s HIGH            only HIGH/CRITICAL
-#    bash linux_hardening_check.sh -j                 JSON output to stdout
+#    bash linux_hardening_check.sh -j                 JSON report to stdout
+#    bash linux_hardening_check.sh -o report.json     write JSON report to file
 #    bash linux_hardening_check.sh -q                 quiet (suppress banner)
 #    bash linux_hardening_check.sh -h                 help
 #
@@ -21,7 +22,9 @@ CATS="ssh firewall kernel users services files logging"
 SSH_CONFIG="/etc/ssh/sshd_config"
 
 PASS=0; FAIL=0; SSCORE=0; TOTAL=0
-JSON_MODE=0; QUIET=0; SEV_FILTER=""; SELECTED=(); EXIT=0
+JSON_MODE=0; QUIET=0; OUTFILE=""; SEV_FILTER=""; SELECTED=(); EXIT=0
+ROWS=(); declare -A FIX
+START=$(date +%s)
 
 # severity pass/fail tally (for summary)
 S_CR_P=0; S_CR_T=0; S_HI_P=0; S_HI_T=0; S_ME_P=0; S_ME_T=0; S_LO_P=0; S_LO_T=0
@@ -34,6 +37,7 @@ while [ $# -gt 0 ]; do
     -m|--modules) IFS=',' read -ra SELECTED <<< "$2"; shift 2 ;;
     -s|--severity) SEV_FILTER="${2^^}"; shift 2 ;;
     -j|--json) JSON_MODE=1; shift ;;
+    -o|--outfile) OUTFILE="$2"; shift 2 ;;
     -q|--quiet) QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 64 ;;
@@ -48,7 +52,9 @@ else
 fi
 
 # ---- output helpers ---------------------------------------------------------
-J_RESULT='{"category":"%s","id":%s,"severity":"%s","name":"%s","expected":"%s","actual":"%s","status":"%s"}'
+J_RESULT='{"category":"%s","id":%s,"severity":"%s","name":"%s","expected":"%s","actual":"%s","status":"%s","fix":"%s"}'
+
+jesc() { printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' '; }
 
 _sev_tally() {  # tally severity pass/fail counters
   case "$1" in
@@ -70,13 +76,16 @@ _sev_reported() {  # severity filters
 }
 
 emit() {  # emit <cat> <id> <sev> <name> <expected> <actual> <status>
-  local st="$7"
+  local st="$7" fix jfix jrow
+  fix="${FIX[$4]:-}"
+  jfix="$(jesc "$fix")"
+  jrow="$(printf "$J_RESULT" "$1" "$2" "$3" "$(jesc "$4")" "$(jesc "$5")" "$(jesc "$6")" "$st" "$jfix")"
+  ROWS+=("${1}"$'\t'"${jrow}")
   TOTAL=$((TOTAL+1))
   _sev_tally "$3" "$st"
   [ "$st" = "PASS" ] && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
 
   if [ "$JSON_MODE" -eq 1 ]; then
-    printf "$J_RESULT\n" "$1" "$2" "$3" "$4" "$5" "$6" "$st"
     return 0
   fi
   _sev_reported "$3" || return 0
@@ -86,6 +95,7 @@ emit() {  # emit <cat> <id> <sev> <name> <expected> <actual> <status>
     printf '  %sFAIL %s%s  %s\n' "$R" "[$3]" "$N" "$4"
     printf '  %sExpected: %s%s\n' "$BD" "$5" "$N"
     printf '  %sActual:   %s%s\n' "$BD" "$6" "$N"
+    [ -n "$fix" ] && printf '  %sFix:     %s%s\n' "$G" "$fix" "$N"
   fi
   return 0
 }
@@ -104,6 +114,111 @@ section_end() {  # section_end <count>
 have() { command -v "$1" >/dev/null 2>&1; }
 svc_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
 sshd_T() { if have sshd; then sshd -T 2>/dev/null; fi; }
+
+# ---- suggested fixes (v2.0) ------------------------------------------------
+# keyed by exact check name as passed to emit()
+FIX["PasswordAuthentication disabled"]="Append 'PasswordAuthentication no' to /etc/ssh/sshd_config, validate with sshd -t, then reload ssh (systemctl reload ssh)."
+FIX["PermitRootLogin disabled"]="Set 'PermitRootLogin prohibit-password' or 'no' in /etc/ssh/sshd_config."
+FIX["PermitEmptyPasswords disabled"]="Ensure 'PermitEmptyPasswords no' is set in /etc/ssh/sshd_config."
+FIX["X11Forwarding disabled"]="Set 'X11Forwarding no' in /etc/ssh/sshd_config."
+FIX["MaxAuthTries <= 4"]="Set 'MaxAuthTries 4' (or lower) in /etc/ssh/sshd_config."
+FIX["ClientAliveInterval 300-600"]="Set 'ClientAliveInterval 300' in /etc/ssh/sshd_config."
+FIX["ClientAliveCountMax <= 3"]="Set 'ClientAliveCountMax 3' (or lower) in /etc/ssh/sshd_config."
+FIX["LoginGraceTime <= 60"]="Set 'LoginGraceTime 60' (or lower) in /etc/ssh/sshd_config."
+FIX["AllowTcpForwarding disabled"]="Set 'AllowTcpForwarding no' in /etc/ssh/sshd_config."
+FIX["AllowAgentForwarding disabled"]="Set 'AllowAgentForwarding no' in /etc/ssh/sshd_config."
+FIX["MaxSessions <= 4"]="Set 'MaxSessions 4' or lower in /etc/ssh/sshd_config."
+FIX["MaxStartups configured"]="Set 'MaxStartups 10:30:60' in /etc/ssh/sshd_config."
+FIX["Login banner configured"]="Create a banner file (e.g. /etc/issue.net) and set 'Banner /etc/issue.net' in sshd_config."
+FIX["No weak ciphers"]="Restrict ciphers to aes256-gcm@openssh.com,aes128-gcm@openssh.com,chacha20-poly1305@openssh.com in sshd_config."
+FIX["No weak MACs"]="Restrict MACs to hmac-sha2-256,hmac-sha2-512 in /etc/ssh/sshd_config."
+FIX["No weak key exchange"]="Restrict KexAlgorithms to curve25519-sha256,diffie-hellman-group16-sha512 in sshd_config."
+FIX["SSH host key permissions <= 600"]="Run: chmod 600 /etc/ssh/ssh_host_*_key"
+FIX["ED25519 host key present"]="Generate an ed25519 host key: ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N '' ; systemctl restart ssh"
+
+FIX["INPUT chain policy is DROP"]="Set the default input policy to DROP (nftables: 'policy drop' on the input chain; iptables: iptables -P INPUT DROP)."
+FIX["OUTPUT chain policy configured"]="Explicitly set an output policy (nftables 'policy drop'; iptables -P OUTPUT DROP) instead of the implicit ACCEPT."
+FIX["ESTABLISHED/RELATED accepted"]="Add a rule accepting established/related traffic, e.g. nft 'ct state established,related accept' or iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT."
+FIX["SSH not open to 0.0.0.0/0"]="Restrict SSH to trusted source networks (-s <cidr>) in your firewall accept rule instead of allowing from any."
+FIX["ICMP rate limiting"]="Add an ICMP rate limit, e.g. nft 'icmp type echo-request limit rate 5/second accept'."
+FIX["Drop logging configured"]="Add a logging rule for dropped traffic (nft 'log prefix \"dropped: \"' or iptables -A INPUT -j LOG) for forensic visibility."
+FIX["FORWARD chain policy is DROP"]="Set the forward policy to DROP (iptables -P FORWARD DROP / nftables 'policy drop')."
+FIX["Minimal wildcard listeners"]="Bind services to specific interfaces/addresses; replace 0.0.0.0: and ::: listeners where possible."
+FIX["SMB not exposed on 0.0.0.0"]="Stop and disable Samba (systemctl --now disable smbd nmbd) or restrict it to the local subnet."
+FIX["Ports inventory"]="Review the listening ports and close or firewall any service that is not required."
+
+FIX["ASLR enabled (2)"]="Set 'kernel.randomize_va_space = 2' in /etc/sysctl.d/ (e.g. 99-security.conf) and run sysctl -p."
+FIX["IP forwarding disabled"]="Set 'net.ipv4.ip_forward = 0' in /etc/sysctl.d/ unless routing is required."
+FIX["IPv4 source routing disabled"]="Set 'net.ipv4.conf.all.accept_source_route = 0' and 'net.ipv4.conf.default.accept_source_route = 0'."
+FIX["IPv4 ICMP redirects disabled"]="Set 'net.ipv4.conf.all.accept_redirects = 0' and the default interface value."
+FIX["IPv4 send redirects disabled"]="Set 'net.ipv4.conf.all.send_redirects = 0'."
+FIX["TCP SYN cookies enabled"]="Set 'net.ipv4.tcp_syncookies = 1'."
+FIX["ICMP broadcast echo ignored"]="Set 'net.ipv4.icmp_echo_ignore_broadcasts = 1'."
+FIX["Bogus ICMP responses ignored"]="Set 'net.ipv4.icmp_ignore_bogus_error_responses = 1'."
+FIX["Martian logging enabled"]="Set 'net.ipv4.conf.all.log_martians = 1'."
+FIX["IPv6 redirects disabled"]="Set 'net.ipv6.conf.all.accept_redirects = 0' and the default value."
+FIX["IPv6 source routing disabled"]="Set 'net.ipv6.conf.all.accept_source_route = 0'."
+FIX["IPv6 router advertisements off"]="Set 'net.ipv6.conf.all.accept_ra = 0' where IPv6 routing is not required."
+FIX["Reverse path filtering on"]="Set 'net.ipv4.conf.all.rp_filter = 1'."
+FIX["dmesg restricted"]="Set 'kernel.dmesg_restrict = 1'."
+FIX["Kernel pointers hidden"]="Set 'kernel.kptr_restrict = 2' (or 1)."
+FIX["Yama ptrace scope >= 1"]="Set 'kernel.yama.ptrace_scope = 1'."
+FIX["SUID core dumps disabled"]="Set 'fs.suid_dumpable = 0'."
+FIX["Unprivileged BPF disabled"]="Set 'kernel.unprivileged_bpf_disabled = 1'."
+FIX["NX/Execute Shield"]="Ensure the CPU supports NX (nx flag in /proc/cpuinfo) and that no conflicting legacy exec-shield settings disable it."
+FIX["KASLR not disabled"]="Remove 'nokaslr' from the kernel cmdline unless it is intentional."
+
+FIX["Root account locked/no password"]="Lock the root account: passwd -l root (root login only via su/sudo)."
+FIX["Only root has UID 0"]="Review UID-0 accounts in /etc/passwd and rename/remove any account other than root (usermod -u)."
+FIX["Password max age <= 90 days"]="Set 'PASS_MAX_DAYS 90' in /etc/login.defs."
+FIX["Password min age >= 1"]="Set 'PASS_MIN_DAYS 1' in /etc/login.defs."
+FIX["Password min length >= 12"]="Set 'PASS_MIN_LEN 12' in /etc/login.defs and 'minlen=12' in pam_pwquality."
+FIX["Password warning >= 7 days"]="Set 'PASS_WARN_AGE 7' in /etc/login.defs."
+FIX["No empty passwords"]="Lock accounts with empty passwords: passwd -l <user>."
+FIX["No NOPASSWD sudo"]="Remove NOPASSWD entries from /etc/sudoers and /etc/sudoers.d/."
+FIX["Sudo use_pty enabled"]="Add 'Defaults use_pty' to a file under /etc/sudoers.d/."
+FIX["Sudo logging"]="Add 'Defaults logfile=/var/log/sudo.log' and optionally log_input/log_output under /etc/sudoers.d/."
+FIX["Sudo timeout <= 5 min"]="Set 'Defaults timestamp_timeout=5' in a sudoers file."
+FIX["Account lockout configured"]="Enable account lockout in PAM (pam_faillock or pam_tally2) in the auth stack."
+FIX["Password complexity module"]="Install libpam-pwquality (apt install libpam-pwquality) and add pam_pwquality to the password PAM stack."
+FIX["Umask 027 or stricter"]="Set 'UMASK 027' in /etc/login.defs."
+FIX["Home dirs not world-readable"]="Remove group/other read/execute bits on user home directories: chmod o-rx /home/<user>."
+FIX[".ssh dirs are 700"]="Set strict permissions on .ssh directories: chmod 700 /home/<user>/.ssh"
+FIX["authorized_keys are 600"]="Set strict permissions on authorized_keys: chmod 600 /home/<user>/.ssh/authorized_keys"
+FIX["No .rhosts files"]="Remove legacy ~/.rhosts and ~/.shosts trust files."
+
+FIX["Unattended upgrades active"]="Install and enable unattended-upgrades: apt install unattended-upgrades && systemctl enable --now unattended-upgrades."
+FIX["Auto-update configured"]="Set 'APT::Periodic::Unattended-Upgrade \"1\"' in /etc/apt/apt.conf.d/20auto-upgrades."
+FIX["Fail2ban active"]="Install and start fail2ban: apt install fail2ban && systemctl enable --now fail2ban."
+FIX["Auditd active"]="Install and start auditd: apt install auditd && systemctl enable --now auditd."
+FIX["Rsyslog active"]="Install and start rsyslog: apt install rsyslog && systemctl enable --now rsyslog."
+FIX["MAC framework active"]="Install AppArmor (apt install apparmor apparmor-utils) and enable it on the kernel cmdline (apparmor=1 security=apparmor)."
+FIX["Docker socket perms"]="Make the Docker socket root:docker owned: chown root:docker /var/run/docker.sock && chmod 660 /var/run/docker.sock."
+FIX["Docker daemon not on 0.0.0.0:2375"]="Do not expose the Docker daemon over TCP; remove '-H tcp://0.0.0.0:2375' from the daemon config."
+FIX["NTP sync active"]="enable the time sync: systemctl enable --now systemd-timesyncd (or install chrony/ntp)."
+FIX["No failed services"]="Inspect and fix failed units: systemctl --failed and journalctl -u <unit>."
+FIX["No pending security updates"]="Apply available updates: apt upgrade (and enable unattended-upgrades for auto patching)."
+FIX["No reboot required"]="Reboot the host to activate pending kernel and library updates."
+
+FIX["/tmp nosuid"]="Add 'nosuid' to the /tmp entry in /etc/fstab."
+FIX["/tmp nodev"]="Add 'nodev' to the /tmp entry in /etc/fstab."
+FIX["No unexpected SUID binaries"]="Audit SUID binaries (find / -perm -4000) and remove unexpected setuid bits: chmod u-s <path>."
+FIX["No world-writable files"]="Restrict permissions on world-writable files: chmod o-w <path>."
+FIX["No world-writable dirs"]="Remove write bits or set the sticky bit on world-writable directories: chomd o-w <dir> / chmod +t <dir>."
+FIX["Critical file perms correct"]="Fix permissions: chmod 644 /etc/passwd; 640 or 600 for /etc/shadow /etc/gshadow; 440/400/600 for /etc/sudoers /etc/crontab."
+FIX["No unowned files"]="Assign missing ownership: chown <user>:<group> <path> (find / -xdev -nouser -o -nogroup)."
+
+FIX["Rsyslog active"]="Install and start rsyslog: apt install rsyslog && systemctl enable --now rsyslog."
+FIX["Journal storage"]="Enable persistent journal: mkdir -p /var/log/journal && systemd-tmpfiles --create --prefix /var/log/journal."
+FIX["Auditd active"]="Install and start auditd: apt install auditd && systemctl enable --now auditd."
+FIX["Audit rules loaded"]="Load audit rules from /etc/audit/rules.d/ (see linux_harden.sh --module logging) and restart auditd."
+FIX["Audit backlog configured"]="Set 'kernel.auditd_backlog_limit = 8192' in sysctl and raise the audit daemon backlog."
+FIX["Critical files audited"]="Add watch rules, e.g. -w /etc/passwd -p wa, -w /etc/shadow -p wa, -w /etc/sudoers -p wa in /etc/audit/rules.d/."
+FIX["Logrotate configured"]="Install logrotate (apt install logrotate) and verify /etc/logrotate.conf and /etc/logrotate.d/."
+FIX["Logrotate compression"]="Add 'compress' to /etc/logrotate.conf to gzip rotated logs."
+FIX["Log retention >= 4"]="Increase rotation count, e.g. 'rotate 4' in /etc/logrotate.conf."
+FIX["Remote syslog"]="Configure a remote syslog sink in /etc/rsyslog.conf, e.g. '*.* @@logserver.example.com:514'."
+FIX["Auth log exists"]="Ensure rsyslog writes the auth log: 'auth,authpriv.*  /var/log/auth.log' in /etc/rsyslog.d/."
 
 # =============================================================================
 #  SSH
@@ -673,7 +788,7 @@ banner() {
   [ "$JSON_MODE" -eq 1 ] || [ "$QUIET" -eq 1 ] && return 0
   printf '%s\n' "$BD==============================================================$N"
   printf '%s\n' "$BD          Linux Hardening Assessment Tool (Bash)$N"
-  printf '%s\n' "$BD          Security Posture Scanner v1.0$N"
+  printf '%s\n' "$BD          Security Posture Scanner v2.0$N"
   printf '%s\n' "$BD==============================================================$N"
   printf '  Target: %s\n  Time:   %s\n' "$(hostname 2>/dev/null || echo unknown)" "$(date '+%Y-%m-%d %H:%M:%S')"
 }
@@ -703,6 +818,50 @@ sev_bar() {  # sev_bar <pass> <total>
   printf '%s  %d/%d passed\n' "$N" "$p" "$t"
 }
 
+grade_of() {  # grade_of <score>
+  local s="$1"
+  if   [ "$s" -ge 90 ]; then echo "A"
+  elif [ "$s" -ge 75 ]; then echo "B"
+  elif [ "$s" -ge 60 ]; then echo "C"
+  elif [ "$s" -ge 50 ]; then echo "D"
+  else echo "F"; fi
+}
+
+report_doc() {  # assemble the full JSON report (v2.0)
+  local cat= r= arr= line= bycat=""
+  for cat in ssh firewall kernel users services files logging; do
+    arr="["
+    for r in "${ROWS[@]}"; do
+      [ "${r%$'\t'*}" = "$cat" ] && arr+="${r#*$'\t'},"
+    done
+    arr="${arr%,}]"
+    [ -n "$bycat" ] && bycat+=","
+    bycat+="$(printf '\n    "%s": %s' "$cat" "$arr")"
+  done
+  cat <<EOF
+{
+  "tool": "linux_hardening_check.sh",
+  "version": "2.0",
+  "hostname": "$(hostname 2>/dev/null || echo unknown)",
+  "timestamp": "$(date -Iseconds)",
+  "elapsed_seconds": $(( $(date +%s) - START )),
+  "score": $SSCORE,
+  "grade": "$(grade_of "$SSCORE")",
+  "total": $TOTAL,
+  "passed": $PASS,
+  "failed": $FAIL,
+  "by_severity": {
+    "CRITICAL": { "passed": $S_CR_P, "total": $S_CR_T },
+    "HIGH":     { "passed": $S_HI_P, "total": $S_HI_T },
+    "MEDIUM":   { "passed": $S_ME_P, "total": $S_ME_T },
+    "LOW":      { "passed": $S_LO_P, "total": $S_LO_T }
+  },
+  "categories": {$bycat
+  }
+}
+EOF
+}
+
 summary() {
   local score=0
   if [ "$TOTAL" -gt 0 ]; then
@@ -711,9 +870,12 @@ summary() {
   fi
   SSCORE=$score
 
+  if [ -n "$OUTFILE" ]; then
+    report_doc > "$OUTFILE"
+    printf 'Report written: %s\n' "$OUTFILE"
+  fi
   if [ "$JSON_MODE" -eq 1 ]; then
-    printf '{"host":"%s","time":"%s","score":%s,"passed":%s,"failed":%s,"total":%s}\n' \
-      "$(hostname 2>/dev/null)" "$(date -Iseconds)" "$score" "$PASS" "$FAIL" "$TOTAL"
+    report_doc
     return 0
   fi
 

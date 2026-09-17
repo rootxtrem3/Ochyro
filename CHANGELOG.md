@@ -20,3 +20,12 @@ All notable changes to this project. Dates follow the commit history.
 
 ### 2026-09-11
 - Add changelog; final polish pass.
+
+## [2.0.0] - 2026-09-11
+
+- Scanners now emit a full JSON report (score, grade, per-severity breakdown,
+  results) with a suggested remediation fix for every failed check.
+- `linux_hardening_check.sh`: add `-o/--outfile`; every check (96) ships a fix.
+- `windows_hardening_check.ps1`: add `-OutFile`; every check (45) ships a fix;
+  JSON output is kept free of console decorations.
+- The scanner state that v1.0 shipped with is preserved under the `v1.0` tag.

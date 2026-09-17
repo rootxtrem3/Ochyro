@@ -25,10 +25,15 @@ Security posture scanners and interactive hardening scripts for Linux and Window
 # Linux scanner
 bash linux_hardening_check.sh              # all categories
 bash linux_hardening_check.sh -m ssh,fw    # specific categories
-bash linux_hardening_check.sh -j           # JSON output
+bash linux_hardening_check.sh -j           # full JSON report
+bash linux_hardening_check.sh -o report.json   # write report to a file
 
 # Windows scanner (PowerShell 5.1+)
 powershell -ExecutionPolicy Bypass -File windows_hardening_check.ps1
+powershell -ExecutionPolicy Bypass -File windows_hardening_check.ps1 -Json       # full JSON report
+powershell -ExecutionPolicy Bypass -File windows_hardening_check.ps1 -OutFile report.json
+
+# Suggested fixes are shown next to every failed check, in both human and JSON output.
 ```
 
 ### Hardening
